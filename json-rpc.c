@@ -247,13 +247,32 @@ struct jrpc_param {
 
 static void * jrpc_execute(void * ptr) {
   struct jrpc_param * p = (struct jrpc_param *)ptr;
-  char buff[4096] = {0};
-  int rc = recv(p->conn->fd, buff, 4096, 0);
   JSON_Value * obj = NULL;
-  if (rc <= 0) {
-    goto done;
+  char * buff = NULL;
+  ssize_t rc, plen = 0, len = 0;
+  while (1) {
+    if (plen >= len) {
+      char * tmp;
+      len += 4096;
+      tmp = realloc(buff, len);
+      if (NULL == tmp) break;
+      buff = tmp;
+    }
+    rc = recv(p->conn->fd, buff + plen, 4096, 0);
+    if (rc == -1) {
+      if(errno == EAGAIN || errno == EWOULDBLOCK) {
+        break;
+      } else {
+        free(buff);
+        return NULL;
+      }
+    } else if (rc == 0) {
+      goto done;
+    } else {
+      plen += rc;
+    }
   }
-  buff[rc] = '\0';
+  buff[plen] = '\0';
   int hdr = 1, version = 0;
   char * payload = strstr(buff, "\r\n\r\n");
   if (payload) {
@@ -330,6 +349,7 @@ fail:
   );
 done:
   if (obj) json_value_free(obj);
+  if (buff) free(buff);
   (void)remove_from_epoll(p->srv->pid, p->conn->fd);
   close(p->conn->fd);
   return NULL;
