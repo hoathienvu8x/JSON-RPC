@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <json-rpc.h>
+#include <pthread.h>
 
 #define MAXEPOLLSIZE  (1000)
 #define BACKLOG       (200)
@@ -29,6 +30,24 @@ static int make_non_blocking(int fd) {
     #ifndef NDEBUG
     perror("fcntl");
     #endif
+    return -1;
+  }
+  return 0;
+}
+
+static int add_to_epoll(int pid, int fd, uint32_t events) {
+  struct epoll_event ev;
+  memset(&ev, 0, sizeof(ev));
+  ev.events = events;
+  ev.data.fd = fd;
+  if (epoll_ctl(pid, EPOLL_CTL_ADD, fd, &ev) < 0) {
+    return -1;
+  }
+  return 0;
+}
+
+static int remove_from_epoll(int pid, int fd) {
+  if (epoll_ctl(pid, EPOLL_CTL_DEL, fd, NULL) < 0) {
     return -1;
   }
   return 0;
@@ -221,14 +240,18 @@ static JSON_Value * jrpc_get_procedure(
   return NULL;
 }
 
-static void jrpc_execute(
-  struct jrpc_server * srv, struct jrpc_connection * conn
-) {
+struct jrpc_param {
+  struct jrpc_server * srv;
+  struct jrpc_connection * conn;
+};
+
+static void * jrpc_execute(void * ptr) {
+  struct jrpc_param * p = (struct jrpc_param *)ptr;
   char buff[4096] = {0};
-  int rc = recv(conn->fd, buff, 4096, 0);
+  int rc = recv(p->conn->fd, buff, 4096, 0);
   JSON_Value * obj = NULL;
   if (rc <= 0) {
-    return;
+    goto done;
   }
   buff[rc] = '\0';
   int hdr = 1, version = 0;
@@ -268,21 +291,21 @@ static void jrpc_execute(
   }
   JSON_Value * data = NULL;
   if (strcmp(method, "list_procedures") == 0) {
-    data = jrpc_list_procedures(srv, params);
+    data = jrpc_list_procedures(p->srv, params);
   } else if (strcmp(method, "get_procedure") == 0) {
-    data = jrpc_get_procedure(srv, params);
+    data = jrpc_get_procedure(p->srv, params);
     if (!data) {
       jrpc_send_error(
-        conn, JRPC_METHOD_NOT_FOUND,
+        p->conn, JRPC_METHOD_NOT_FOUND,
         "Method not found.", id, hdr, version
       );
       goto done;
     }
   } else {
-    jrpc_eval * func = jrpc_server_get_procedure(srv, method);
+    jrpc_eval * func = jrpc_server_get_procedure(p->srv, method);
     if (!func) {
       jrpc_send_error(
-        conn, JRPC_METHOD_NOT_FOUND,
+        p->conn, JRPC_METHOD_NOT_FOUND,
         "Method not found.", id, hdr, version
       );
       goto done;
@@ -291,22 +314,25 @@ static void jrpc_execute(
   }
   if (!data) {
     jrpc_send_error(
-      conn, JRPC_INTERNAL_ERROR,
+      p->conn, JRPC_INTERNAL_ERROR,
       "JSON-RPC internal error.", id, hdr, version
     );
     goto done;
   }
-  jrpc_send_response(conn, data, id, hdr, version);
+  jrpc_send_response(p->conn, data, id, hdr, version);
   json_value_free(data);
   goto done;
 
 fail:
   jrpc_send_error(
-    conn, JRPC_INVALID_REQUEST,
+    p->conn, JRPC_INVALID_REQUEST,
     "The JSON sent is not a valid Request object.", id, hdr, version
   );
 done:
   if (obj) json_value_free(obj);
+  (void)remove_from_epoll(p->srv->pid, p->conn->fd);
+  close(p->conn->fd);
+  return NULL;
 }
 
 int jrpc_server_init(
@@ -358,24 +384,6 @@ int jrpc_server_init(
 fail:
   freeaddrinfo(info);
   return -1;
-}
-
-static int add_to_epoll(int pid, int fd, uint32_t events) {
-  struct epoll_event ev;
-  memset(&ev, 0, sizeof(ev));
-  ev.events = events;
-  ev.data.fd = fd;
-  if (epoll_ctl(pid, EPOLL_CTL_ADD, fd, &ev) < 0) {
-    return -1;
-  }
-  return 0;
-}
-
-static int remove_from_epoll(int pid, int fd) {
-  if (epoll_ctl(pid, EPOLL_CTL_DEL, fd, NULL) < 0) {
-    return -1;
-  }
-  return 0;
 }
 
 #define prepare(p) do { if (p) { free(p); } p = NULL; } while(0)
@@ -478,10 +486,21 @@ void jrpc_server_listen(struct jrpc_server * srv) {
           struct jrpc_connection conn = {
             .fd = events[i].data.fd
           };
-          jrpc_execute(srv, &conn);
+          struct jrpc_param args = (struct jrpc_param) {
+            .srv = srv,
+            .conn = &conn
+          };
+          pthread_t th;
+          if (pthread_create(&th, NULL, jrpc_execute, &args) != 0) {
+            (void)remove_from_epoll(srv->pid, events[i].data.fd);
+            close(events[i].data.fd);
+          } else {
+            pthread_detach(th);
+          }
+        } else {
+          (void)remove_from_epoll(srv->pid, events[i].data.fd);
+          close(events[i].data.fd);
         }
-        (void)remove_from_epoll(srv->pid, events[i].data.fd);
-        close(events[i].data.fd);
       }
     }
   }
