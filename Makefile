@@ -20,6 +20,10 @@ json-rpc: objects objects/rpc.o $(OBJECTS)
 	@$(CC) objects/rpc.o $(OBJECTS) -o $@ $(LDFLAGS)
 	@$(RM) objects/rpc.o
 
+rpc: objects objects/remote.o objects/parson.o
+	@$(CC) objects/remote.o objects/parson.o -o $@ $(LDFLAGS)
+	@$(RM) objects/remote.o objects/parson.o
+
 objects:
 	@mkdir -p objects
 
